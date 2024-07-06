@@ -1,0 +1,1118 @@
+
+File: ./concurrent_clients_test.go
+```go
+package main
+
+import (
+	"fmt"
+	"net"
+	"sync"
+	"testing"
+)
+
+func TestConcurrentPings(t *testing.T) {
+	const (
+		numClients = 100
+		address    = "localhost:3312"
+		pingCmd    = "*1\r\n$4\r\nPING\r\n"
+	)
+
+	var wg sync.WaitGroup
+	wg.Add(numClients)
+
+	for i := 0; i < numClients; i++ {
+		go func(clientID int) {
+			defer wg.Done()
+
+			conn, err := net.Dial("tcp", address)
+			if err != nil {
+				t.Errorf("Client %d: Error connecting: %v", clientID, err)
+				return
+			}
+			defer conn.Close()
+
+			_, err = conn.Write([]byte(pingCmd))
+			if err != nil {
+				t.Errorf("Client %d: Error writing to connection: %v", clientID, err)
+				return
+			}
+
+			buffer := make([]byte, 1024)
+			n, err := conn.Read(buffer)
+			if err != nil {
+				t.Errorf("Client %d: Error reading from connection: %v", clientID, err)
+			} else {
+				response := string(buffer[:n])
+				fmt.Printf("Client %d received response: %s\n", clientID, response)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+}
+```
+
+File: ./app/config.go
+```go
+package app
+
+type Config struct {
+	Port        int
+	Host        string
+	Master_host string
+	Master_port int
+}
+
+func NewConfig(host string, port int, replica_host string, replica_port int) *Config {
+	return &Config{
+		Host:        host,
+		Port:        port,
+		Master_host: replica_host,
+		Master_port: replica_port,
+	}
+}
+```
+
+File: ./app/db.go
+```go
+package app
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+// Item struct to store value and lifetime.
+type Item struct {
+	Value    interface{}
+	Lifetime time.Time
+}
+
+// Stream struct to hold entries.
+type Stream struct {
+	Entries map[string]interface{}
+}
+
+// MemoryStorage struct to handle storage of items and streams.
+type MemoryStorage struct {
+	storage map[string]Item
+	mutex   sync.Mutex
+}
+
+// NewMemoryStorage creates a new instance of MemoryStorage.
+func NewMemoryStorage() *MemoryStorage {
+	return &MemoryStorage{
+		storage: make(map[string]Item),
+	}
+}
+
+// Save stores a value with an optional lifetime.
+func (ms *MemoryStorage) Save(key string, value interface{}, lifetime *time.Time) {
+	ms.mutex.Lock()
+	defer ms.mutex.Unlock()
+	item := Item{Value: value}
+	if lifetime != nil {
+		item.Lifetime = *lifetime
+	}
+	ms.storage[key] = item
+}
+
+// Get retrieves a value by key.
+func (ms *MemoryStorage) Get(key string) interface{} {
+	ms.mutex.Lock()
+	defer ms.mutex.Unlock()
+	item, exists := ms.storage[key]
+	fmt.Print("INFO || MEMORY || GET key=", key, " value=", item.Value, "\n")
+	if !exists {
+		return nil
+	}
+
+	return item.Value
+}
+
+// GetType retrieves the type of the value stored at key.
+func (ms *MemoryStorage) GetType(key string) string {
+	ms.mutex.Lock()
+	defer ms.mutex.Unlock()
+	item, exists := ms.storage[key]
+	if !exists || (!item.Lifetime.IsZero() && ms.Expired(item.Lifetime)) {
+		return "none"
+	}
+
+	switch item.Value.(type) {
+	case string:
+		return "string"
+	case int:
+		return "integer"
+	case float64:
+		return "float"
+	default:
+		return "unknown"
+	}
+}
+
+// Delete removes an item by key.
+func (ms *MemoryStorage) Delete(key string) int {
+	ms.mutex.Lock()
+	defer ms.mutex.Unlock()
+	if _, exists := ms.storage[key]; exists {
+		delete(ms.storage, key)
+		return 1
+	}
+	return 0
+}
+
+// Expired checks if the item is expired.
+func (ms *MemoryStorage) Expired(lifetime time.Time) bool {
+	return time.Now().After(lifetime)
+}
+
+// PrintAll prints all items in storage.
+func (ms *MemoryStorage) PrintAll() {
+	ms.mutex.Lock()
+	defer ms.mutex.Unlock()
+	if len(ms.storage) == 0 {
+		fmt.Println("Memory is empty")
+		return
+	}
+	for key, item := range ms.storage {
+		fmt.Printf("%s: %v\n", key, item.Value)
+	}
+}
+
+// Exists checks if a key exists in storage.
+func (ms *MemoryStorage) Exists(key string) bool {
+	ms.mutex.Lock()
+	defer ms.mutex.Unlock()
+	_, exists := ms.storage[key]
+	return exists
+}
+
+// Keys retrieves all keys in storage.
+func (ms *MemoryStorage) Keys() []string {
+	ms.mutex.Lock()
+	defer ms.mutex.Unlock()
+	keys := make([]string, 0, len(ms.storage))
+	for key := range ms.storage {
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+// Flush clears all items in storage.
+func (ms *MemoryStorage) Flush() {
+	ms.mutex.Lock()
+	defer ms.mutex.Unlock()
+	ms.storage = make(map[string]Item)
+}
+```
+
+File: ./app/vault.go
+```go
+package app
+
+import (
+	"encoding/base64"
+	"fmt"
+	"net"
+	"rednav/utils"
+	"sync"
+	"time"
+)
+
+type Vault struct {
+	config                 *Config
+	role                   string
+	MainReplicaID          string
+	MainReplicaOffset      int
+	memory                 *MemoryStorage
+	ReplicaPresent         bool
+	alreadyConnectedMaster bool
+	MasterConn             net.Conn
+	mutex                  sync.Mutex
+}
+
+const (
+	ACK            = "ACK"
+	CAPABILITY     = "capa"
+	CONFIG         = "config"
+	ECHO           = "echo"
+	GET            = "get"
+	TYPE           = "type"
+	GETACK         = "GETACK"
+	MASTER         = "master"
+	INFO           = "info"
+	LISTENING_PORT = "listening-port"
+	SET            = "set"
+	XADD           = "xadd"
+	REPLICA        = "replica"
+	PING           = "ping"
+	PX             = "px"
+	PSYNC          = "PSYNC"
+	REPLICATION    = "replication"
+	RELPCONF       = "REPLCONF"
+
+	OK = "+OK\r\n"
+
+	LEN_CAPABILITY     = 2
+	LEN_CONFIG         = 1
+	LEN_ECHO           = 2
+	LEN_GET            = 2
+	LEN_TYPE           = 2
+	LEN_INFO           = 2
+	LEN_LISTENING_PORT = 2
+	LEN_REPL_CONF      = 1
+	LEN_SET            = 3
+	LEN_PING           = 1
+	LEN_PX             = 2
+	LEN_PSYNC          = 3
+	LEN_GETACK         = 2
+	LEN_XADD           = 2
+)
+
+func NewVault(c *Config) *Vault {
+	v := &Vault{
+		memory:                 NewMemoryStorage(),
+		ReplicaPresent:         false,
+		alreadyConnectedMaster: false,
+		config:                 c,
+	}
+	if c.Master_host == "" && c.Master_port == 0 {
+		v.role = MASTER
+		v.MainReplicaID = utils.GenerateAlphanumericString()
+	} else {
+		v.role = REPLICA
+		v.MainReplicaID = ""
+		v.MainReplicaOffset = 0
+	}
+	if v.role == REPLICA {
+		v.MasterConn = v.OpenConnectionToMaster()
+	}
+	return v
+}
+
+func (v *Vault) SetXAdd(setVals []map[string][]string, data map[string][]interface{}) string {
+	v.mutex.Lock()
+	defer v.mutex.Unlock()
+	var lifetime *time.Time
+	for i, item := range setVals {
+		for key, value := range item {
+			if px, exists := data["px"]; exists {
+				ms := int(px[i].(float64))
+				t := time.Now().Add(time.Duration(ms) * time.Millisecond)
+				lifetime = &t
+			}
+			v.memory.Save(key, value, lifetime)
+		}
+	}
+	return OK
+}
+
+func (v *Vault) SetMemory(key string, value string, expiration *time.Time) {
+	v.mutex.Lock()
+	defer v.mutex.Unlock()
+	v.memory.Save(key, value, expiration)
+}
+
+func (v *Vault) GetMemory(key string) interface{} {
+	return v.memory.Get(key)
+}
+
+func (v *Vault) GetType(key string) string {
+	return v.memory.GetType(key)
+}
+
+func (v *Vault) GetConfig() *Config {
+	return v.config
+}
+
+func (v *Vault) GetInfo() string {
+	if v.IsMaster() {
+		return fmt.Sprintf("role:%s\n", v.role)
+	} else {
+		return fmt.Sprintf("role:%s\nmain_replid:%s\nmain_repl_offset:%d\n", v.role, v.MainReplicaID, v.MainReplicaOffset)
+	}
+
+}
+
+func (v *Vault) OpenConnectionToMaster() net.Conn {
+	address := fmt.Sprintf("%s:%d", v.config.Master_host, v.config.Master_port)
+	conn, err := net.Dial("tcp", address)
+	if err != nil {
+		panic(err)
+	}
+
+	// Perform the handshake only once
+	v.DoHandshake(conn)
+	fmt.Printf("Connected to master %s\n", address)
+	return conn
+}
+
+func (v *Vault) DoHandshake(conn net.Conn) {
+	address := fmt.Sprintf("%s:%d", v.config.Host, v.config.Port)
+	// Do the handshake
+	conn.Write([]byte("*1\r\n$4\r\nping\r\n"))
+	buf := make([]byte, 4096)
+	n, err := conn.Read(buf)
+	if err != nil {
+		fmt.Println("Failed to read from master")
+	}
+	fmt.Printf("Received: %s\n", string(buf[:n]))
+	time.Sleep(100 * time.Millisecond)
+	conn.Write([]byte(fmt.Sprintf("*4\r\n$8\r\nREPLCONF\r\n$7\r\nLISTENING-PORT\r\n$%d\r\n%s\r\n", len(address), address)))
+	buf = make([]byte, 4096)
+	n, err = conn.Read(buf)
+	if err != nil {
+		fmt.Println("Failed to read from master")
+	}
+	fmt.Printf("Received: %s\n", string(buf[:n]))
+	time.Sleep(100 * time.Millisecond)
+	conn.Write([]byte("*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n"))
+	buf = make([]byte, 4096)
+	n, err = conn.Read(buf)
+	if err != nil {
+		fmt.Println("Failed to read from master")
+	}
+	fmt.Printf("Received: %s\n", string(buf[:n]))
+	time.Sleep(100 * time.Millisecond)
+	conn.Write([]byte("*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n"))
+	buf = make([]byte, 4096)
+	n, err = conn.Read(buf)
+	if err != nil {
+		fmt.Println("Failed to read from master")
+	}
+
+	fmt.Printf("Received: %s\n", string(buf[:n]))
+	// Return the connection which will be used further
+}
+
+func (v *Vault) RDBParsed() string {
+	rdb, _ := base64.StdEncoding.DecodeString("UkVESVMwMDEx+glyZWRpcy12ZXIFNy4yLjD6CnJlZGlzLWJpdHPAQPoFY3RpbWXCbQi8ZfoIdXNlZC1tZW3CsMQQAPoIYW9mLWJhc2XAAP/wbjv+wP9aog==")
+	length := len(rdb)
+	parsed := fmt.Sprintf("$%d\r\n%s\r\n", length, rdb)
+	return parsed
+}
+
+func (v *Vault) IsMaster() bool {
+	return v.role == MASTER
+}
+```
+
+File: ./single_replica_test.go
+```go
+package main
+
+import (
+	"bufio"
+	"fmt"
+	"net"
+	"strings"
+	"testing"
+)
+
+// Helper function to send a command and read the response
+func sendCommand(conn net.Conn, command string) (string, error) {
+	fmt.Fprintf(conn, command)
+	response, err := bufio.NewReader(conn).ReadString('\n')
+	return response, err
+}
+
+// Test Command Propagation
+func TestCommandPropagation(t *testing.T) {
+	replicaConn, err := net.Dial("tcp", "localhost:3313")
+	if err != nil {
+		t.Fatalf("Failed to connect to server as replica: %v", err)
+	}
+	defer replicaConn.Close()
+
+	clientConn, err := net.Dial("tcp", "localhost:3312")
+	if err != nil {
+		t.Fatalf("Failed to connect to server as client: %v", err)
+	}
+	defer clientConn.Close()
+
+	// Send write commands as a client
+	commands := []string{
+		"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$1\r\n1\r\n",
+		"*3\r\n$3\r\nSET\r\n$3\r\nbar\r\n$1\r\n2\r\n",
+		"*3\r\n$3\r\nSET\r\n$3\r\nbaz\r\n$1\r\n3\r\n",
+	}
+
+	for _, cmd := range commands {
+		_, err := sendCommand(clientConn, cmd)
+		if err != nil {
+			t.Fatalf("Failed to send command %s: %v", cmd, err)
+		}
+	}
+
+	commands = []string{
+		"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n",
+		"*2\r\n$3\r\nGET\r\n$3\r\nbar\r\n",
+		"*2\r\n$3\r\nGET\r\n$3\r\nbaz\r\n",
+	}
+
+	// Read from the replica and check if the commands are propagated
+	for _, cmd := range commands {
+		response, err := sendCommand(clientConn, cmd)
+		if err != nil {
+			t.Fatalf("Failed to send command %s: %v", cmd, err)
+		}
+		//INFO || Command: GET, Result: {nil   []  []} is not nil
+		if strings.Contains(response, "nil") {
+			t.Fatalf("Failed to propagate command %s: %v", cmd, err)
+		}
+	}
+}
+```
+
+File: ./server/server.go
+```go
+package server
+
+import (
+	"fmt"
+	"net"
+	"os"
+	"rednav/app"
+	"rednav/commands"
+	"rednav/utils"
+	"strings"
+	"time"
+)
+
+var (
+	kMaxArgs = 128
+	kMaxMsg  = 4096
+)
+
+type Server struct {
+	listener           net.Listener
+	conn               net.Conn
+	vault              *app.Vault
+	talkingWithMain    bool
+	talkingWithReplica bool
+	address            string
+	masterConn         net.Conn
+	Replicas           []*net.Conn
+	ReplicasStatus     map[string]bool
+	role               string
+	quitch             chan struct{}
+}
+
+func NewServer(vault *app.Vault, local_addr string) *Server {
+	role := "main"
+	if !vault.IsMaster() {
+		role = "replica"
+	}
+	server := &Server{
+		address:            local_addr,
+		Replicas:           make([]*net.Conn, 0),
+		ReplicasStatus:     make(map[string]bool),
+		talkingWithMain:    false,
+		talkingWithReplica: false,
+		vault:              vault,
+		quitch:             make(chan struct{}),
+		role:               role,
+	}
+	if !server.vault.IsMaster() {
+		server.masterConn = server.vault.MasterConn
+	}
+	return server
+}
+
+func (s *Server) ReplicasConnection(address string) {
+
+	s.talkingWithReplica = true
+	s.vault.ReplicaPresent = true
+	var conn net.Conn
+	var err error
+	for attempt := 0; attempt < 10; attempt++ {
+		conn, err = net.Dial("tcp", address)
+		if err == nil {
+			break
+		}
+		fmt.Printf("Attempt %d: Error connecting to replica: %v\n", attempt+1, err)
+		time.Sleep(2 * time.Second)
+	}
+	if err != nil {
+		fmt.Println("Error connecting to replica: ", err)
+		return
+	}
+	s.Replicas = append(s.Replicas, &conn)
+}
+
+func (s *Server) HeyListen() {
+	listener, err := net.Listen("tcp", s.address)
+	if err != nil {
+		panic(err)
+	}
+	s.listener = listener
+	go s.acceptLoop()
+	<-s.quitch
+}
+
+func (s *Server) acceptLoop() {
+	for {
+		conn, err := s.listener.Accept()
+		s.conn = conn
+		fmt.Printf("INFO || Connection accepted, conn %v\n", conn.LocalAddr().String())
+		if err != nil {
+			os.Exit(1)
+		}
+		go s.handleConnection(conn)
+	}
+}
+
+func (sm *Server) handleConnection(conn net.Conn) {
+	defer conn.Close()
+	for {
+		buf := make([]byte, kMaxMsg)
+		n, err := conn.Read(buf)
+		if err != nil {
+			break
+		}
+
+		request_parsed, err := utils.ParseReq(buf[:n], uint32(kMaxMsg))
+		if err != nil {
+			//send the err back to the client
+			conn.Write([]byte(err.Error()))
+			return
+		}
+
+		response := sm.handleCommand(request_parsed)
+		conn.Write(response)
+		// disconect the client
+	}
+}
+
+func (s *Server) handleCommand(message []string) []byte {
+	result := []byte("-ERR Unknown command\r\n")
+	if len(message) == 0 {
+		return []byte("-ERR Empty command\r\n")
+	}
+
+	cmdName := strings.ToUpper(message[0])
+	args := make([]commands.Command, len(message)-1)
+	for i, arg := range message[1:] {
+		args[i] = commands.Command{Typ: "bulk", Bulk: arg}
+	}
+
+	// Check if the command exists in the handlers map
+	if handler, exists := commands.Handlers[cmdName]; exists {
+		response := handler(s.vault, args, s)
+		result = formatResponse(response)
+	}
+
+	if s.vault.IsMaster() && isWriteCommand(cmdName) {
+		fmt.Printf("INFO || Sending to replicas: %s\n", cmdName)
+		s.sendToReplicas(cmdName, args)
+	}
+
+	if !s.vault.IsMaster() && isWriteCommand(cmdName) {
+		fmt.Printf("INFO || Sending to master: %s\n", cmdName)
+		s.sendToMaster(cmdName, args)
+	}
+
+	fmt.Printf("INFO || Command Result %s\n", result)
+	return result
+}
+
+func (s *Server) sendToMaster(cmd string, args []commands.Command) {
+	encoded := EncodeCommand(cmd, args)
+	response, err := s.vault.MasterConn.Write(encoded)
+
+	if err != nil {
+		fmt.Println("Error sending to master: ", err)
+	}
+
+	fmt.Printf("Response from master: %d\n", response)
+}
+
+// Propagate commands to replicas
+func (s *Server) sendToReplicas(cmd string, args []commands.Command) {
+	encoded := EncodeCommand(cmd, args)
+	for _, replica := range s.Replicas {
+		(*replica).SetWriteDeadline(time.Now().Add(5 * time.Second)) // Set deadline to avoid blocking
+		_, err := (*replica).Write(encoded)
+		if err != nil {
+			fmt.Println("Error writing to replica: ", err)
+		}
+	}
+}
+
+func (s *Server) Shutdown() {
+	close(s.quitch)
+	if s.listener != nil {
+		s.listener.Close()
+	}
+}
+
+func isWriteCommand(cmd string) bool {
+	writeCommands := []string{"SET", "DEL"}
+	for _, wc := range writeCommands {
+		if wc == cmd {
+			return true
+		}
+	}
+	return false
+}
+
+func EncodeCommand(cmd string, args []commands.Command) []byte {
+	var sb strings.Builder
+
+	// Write array header (cmdName + args)
+	sb.WriteString(fmt.Sprintf("*%d\r\n", len(args)+1))
+	sb.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(cmd), cmd))
+
+	// Write each argument in bulk string format
+	for _, cmd := range args {
+		sb.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(cmd.Bulk), cmd.Bulk))
+	}
+
+	return []byte(sb.String())
+}
+
+func formatResponse(cmd commands.Command) []byte {
+	switch cmd.Typ {
+	case "string":
+		return []byte(cmd.Str + "\r\n")
+	case "list":
+		return []byte("*" + fmt.Sprint(len(cmd.List)) + "\r\n" + strings.Join(cmd.List, "\r\n") + "\r\n")
+	case "nil":
+		return []byte("$-1\r\n")
+	case "err":
+		return []byte("-ERR " + cmd.Err + "\r\n")
+	case "arr", "multi":
+		var response []byte
+		for _, subCmd := range cmd.Arr {
+			response = append(response, formatResponse(subCmd)...)
+		}
+		return []byte(fmt.Sprintf("*%d\r\n%s", len(cmd.Arr), response))
+	case "bulk":
+		return []byte(fmt.Sprintf("$%d\r\n%s\r\n", len(cmd.Bulk), cmd.Bulk))
+	default:
+		fmt.Printf("Unknown response type: %v\n", cmd)
+		return []byte("-ERR Unknown response type\r\n")
+	}
+}
+```
+
+File: ./server/replica.go
+```go
+package server
+
+type Replica struct {
+	Path string
+	Port string
+}
+```
+
+File: ./utils/logging.go
+```go
+package utils
+
+import "log"
+
+var logger *log.Logger
+
+func init() {
+	logger = log.New(log.Writer(), "DEBUG: ", log.Ldate|log.Ltime|log.Lshortfile)
+}
+```
+
+File: ./utils/functions.go
+```go
+package utils
+
+import (
+	"math/rand"
+	"time"
+)
+
+func FlattenList(inputList [][]byte) []byte {
+	var flatList []byte
+	for _, sublist := range inputList {
+		flatList = append(flatList, sublist...)
+	}
+	return flatList
+}
+
+func GenerateAlphanumericString() string {
+	const charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	rand.Seed(time.Now().UnixNano())
+	b := make([]byte, 40)
+	for i := range b {
+		b[i] = charset[rand.Intn(len(charset))]
+	}
+	return string(b)
+}
+```
+
+File: ./utils/resp_parser.go
+```go
+package utils
+
+import (
+	"bytes"
+	"errors"
+	"strconv"
+)
+
+const (
+	kMaxMsg  = 4096
+	kMaxArgs = 128
+)
+
+type Conn struct {
+	Rbuf     []byte
+	RbufSize int
+	Wbuf     []byte
+	WbufSize int
+	State    int
+}
+
+const (
+	STATE_REQ = iota
+	STATE_RES
+	STATE_END
+)
+
+func ParseReq(data []byte, length uint32) ([]string, error) {
+	if length < 4 {
+		return nil, errors.New("invalid length")
+	}
+
+	if data[0] != '*' {
+		return nil, errors.New("invalid protocol")
+	}
+
+	// Read number of arguments
+	parts := bytes.Split(data[1:length], []byte("\r\n"))
+	if len(parts) < 3 {
+		return nil, errors.New("invalid message format")
+	}
+
+	numArgs, err := strconv.Atoi(string(parts[0]))
+	if err != nil || numArgs < 1 || numArgs > kMaxArgs {
+		return nil, errors.New("invalid number of arguments")
+	}
+
+	var out []string
+	for i := 1; i < len(parts)-1; i += 2 {
+		out = append(out, string(parts[i+1]))
+	}
+
+	return out, nil
+}
+```
+
+File: ./commands/psync.go
+```go
+package commands
+
+import (
+	"fmt"
+	"rednav/app"
+	"rednav/interfaces"
+)
+
+func PSync(vault *app.Vault, cmd []Command, actions interfaces.ServerActions) Command {
+	// Add replica connectioon to the server
+	resp := make([]Command, 2)
+	resp[0] = Command{Typ: "string", Str: fmt.Sprintf("+FULLRESYNC %s %d\r\n", vault.MainReplicaID, vault.MainReplicaOffset)}
+	file := vault.RDBParsed()
+	resp[1] = Command{Typ: "bulk", Bulk: string(file)}
+
+	return Command{Typ: "multi", Str: "OK", Arr: resp}
+}
+```
+
+File: ./commands/command.go
+```go
+package commands
+
+import (
+	"rednav/app"
+	"rednav/interfaces"
+)
+
+type Command struct {
+	Typ  string
+	Str  string
+	Bulk string
+	List []string
+	Err  string
+	Arr  []Command
+}
+
+var Handlers = map[string]func(*app.Vault, []Command, interfaces.ServerActions) Command{
+	"PING":     Ping,
+	"ECHO":     Echo,
+	"SET":      Set,
+	"GET":      Get,
+	"INFO":     Info,
+	"REPLCONF": ReplConf,
+	"PSYNC":    PSync,
+}
+```
+
+File: ./commands/replconf.go
+```go
+package commands
+
+import (
+	"fmt"
+	"rednav/app"
+	"rednav/interfaces"
+	"strings"
+)
+
+func ReplConf(vault *app.Vault, args []Command, actions interfaces.ServerActions) Command {
+
+	if len(args) < 2 {
+		return Command{Typ: "err", Err: "Not enough arguments for REPLCONF"}
+	}
+
+	option := strings.ToUpper(args[0].Bulk)
+	switch option {
+	case "LISTENING-PORT":
+		actions.ReplicasConnection(args[1].Bulk)
+		// Handle setting listening port
+		if vault.IsMaster() {
+			return Command{Typ: "string", Str: "+OK"}
+		} else {
+			return Command{Typ: "list", List: []string{app.RELPCONF, app.ACK, fmt.Sprint(vault.MainReplicaOffset)}}
+		}
+
+	case "CAPA":
+		// Handle capabilities
+		// Example: Do something with value (e.g., vault.SetCapabilities(value))
+		return Command{Typ: "string", Str: "+OK"}
+	default:
+		return Command{Typ: "err", Err: "Unknown REPLCONF option"}
+	}
+}
+```
+
+File: ./commands/ping_test.go
+```go
+package commands
+
+import (
+	"net"
+	"testing"
+)
+
+func TestPingIntegration(t *testing.T) {
+	// Start your server here if needed
+	// Create a TCP connection to the server
+	conn, err := net.Dial("tcp", "localhost:3312")
+	if err != nil {
+		t.Fatalf("Failed to connect to server: %v", err)
+	}
+	defer conn.Close()
+
+	// Send the PING command
+	_, err = conn.Write([]byte("*1\r\n$4\r\nPING\r\n"))
+	if err != nil {
+		t.Fatalf("Failed to write to connection: %v", err)
+	}
+
+	// Read the response from the server
+	buffer := make([]byte, 1024)
+	n, err := conn.Read(buffer)
+	if err != nil {
+		t.Fatalf("Failed to read from connection: %v", err)
+	}
+
+	// Check the response
+	response := string(buffer[:n])
+	expectedResponse := "+PONG"
+	if response != expectedResponse {
+		t.Errorf("Unexpected response. Got: %s, want: %s", response, expectedResponse)
+	}
+}
+```
+
+File: ./commands/ping.go
+```go
+package commands
+
+import (
+	"rednav/app"
+	"rednav/interfaces"
+)
+
+func Ping(v *app.Vault, args []Command, actions interfaces.ServerActions) Command {
+	if len(args) == 0 {
+		return Command{Typ: "string", Str: "+PONG"}
+	}
+	return Command{Typ: "string", Str: args[0].Bulk}
+}
+```
+
+File: ./commands/get.go
+```go
+package commands
+
+import (
+	"rednav/app"
+	"rednav/interfaces"
+)
+
+func Get(v *app.Vault, args []Command, actions interfaces.ServerActions) Command {
+	if len(args) < 1 {
+		return Command{Typ: "error", Err: "ERR wrong number of arguments for 'get' command"}
+	}
+	key := args[0].Bulk
+
+	// Retrieve the value from the vault, interfaced return as string.
+	value := v.GetMemory(key)
+
+	if value == nil {
+		return Command{Typ: "nil"}
+	}
+
+	return Command{Typ: "string", Str: value.(string)}
+}
+```
+
+File: ./commands/echo.go
+```go
+package commands
+
+import (
+	"rednav/app"
+	"rednav/interfaces"
+)
+
+func Echo(v *app.Vault, args []Command, actions interfaces.ServerActions) Command {
+	if len(args) == 0 {
+		return Command{Typ: "string", Str: ""}
+	}
+	return Command{Typ: "string", Str: args[0].Bulk}
+}
+```
+
+File: ./commands/set.go
+```go
+package commands
+
+import (
+	"fmt"
+	"rednav/app"
+	"rednav/interfaces"
+	"strconv"
+	"time"
+)
+
+func Set(v *app.Vault, args []Command, actions interfaces.ServerActions) Command {
+	if len(args) < 2 {
+		return Command{Typ: "error", Err: "ERR wrong number of arguments for 'set' command"}
+	}
+	key := args[0].Bulk
+	value := args[1].Bulk
+
+	var expiration *time.Time
+
+	// Check for optional "PX" argument for expiration time
+
+	if len(args) >= 4 && args[2].Bulk == "px" {
+		ms, err := strconv.Atoi(args[3].Bulk)
+		if err != nil {
+			return Command{Typ: "error", Err: "ERR invalid expiration time"}
+		}
+		exp := time.Now().Add(time.Duration(ms) * time.Millisecond)
+		expiration = &exp
+	}
+
+	fmt.Printf("Cmd: SET key=%s, value=%s, expiration=%v\n", key, value, expiration)
+	// Store the key-value pair using SetMemory
+	v.SetMemory(key, value, expiration)
+
+	return Command{Typ: "string", Str: "+OK"}
+}
+```
+
+File: ./commands/info.go
+```go
+package commands
+
+import (
+	"rednav/app"
+	"rednav/interfaces"
+)
+
+func Info(v *app.Vault, args []Command, actions interfaces.ServerActions) Command {
+	//return role of the server
+	return Command{Typ: "string", Str: v.GetInfo()}
+}
+```
+
+File: ./main.go
+```go
+package main
+
+import (
+	"flag"
+	"fmt"
+	"os"
+	"os/signal"
+	"rednav/app"
+	server "rednav/server"
+	"strings"
+	"syscall"
+)
+
+func main() {
+	var replica_of string
+	port := flag.Int("port", 3312, "Port to listen on")
+	host := flag.String("host", "localhost", "Host to listen on")
+	flag.StringVar(&replica_of, "replica_of", "", "Host to replicate from")
+	flag.Parse()
+
+	var replicaHost string
+	var replicaPort int
+	if replica_of != "" {
+		replicaParts := strings.Split(replica_of, " ")
+		if len(replicaParts) == 2 {
+			replicaHost = replicaParts[0]
+			fmt.Sscanf(replicaParts[1], "%d", &replicaPort)
+		} else {
+			fmt.Println("Invalid format for --replicaof. Expected format: host port")
+			return
+		}
+	} else {
+		replicaHost = ""
+		replicaPort = 0
+	}
+
+	config := app.NewConfig(*host, *port, replicaHost, replicaPort)
+	vault := app.NewVault(config)
+
+	local_server := server.NewServer(vault, fmt.Sprintf("%s:%d", *host, *port))
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		sig := <-sigCh
+		fmt.Printf("Received signal: %s. Shutting down...\n", sig)
+		local_server.Shutdown()
+	}()
+
+	fmt.Printf("Server running on %s:%d\n", *host, *port)
+	local_server.HeyListen()
+}
+```
+
+File: ./interfaces/server.go
+```go
+package interfaces
+
+type ServerActions interface {
+	ReplicasConnection(string)
+}
+```
+
