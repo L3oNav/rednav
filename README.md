@@ -20,15 +20,6 @@ Before running Rednav, ensure you have the following installed:
 
 - [Go](https://golang.org/dl/) (version 1.21 or higher)
 
-### Installation
-
-Clone the Rednav repository to your local machine:
-
-```bash
-git clone https://github.com/your_github_username/rednav.git
-cd rednav
-```
-
 ### Running The Server
 
 Run the server in the main directory:
